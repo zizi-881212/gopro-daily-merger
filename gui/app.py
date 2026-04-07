@@ -1,145 +1,37 @@
 import os
 import datetime
-import subprocess
+import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
-                             QPushButton, QTreeWidget, QTreeWidgetItem, QLabel, 
-                             QFileDialog, QMessageBox, QTextEdit, QAbstractItemView,
-                             QMenu, QInputDialog, QTreeWidgetItemIterator)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                             QPushButton, QLabel, QFileDialog, QMessageBox, 
+                             QTextEdit, QTreeWidgetItem, QTreeWidgetItemIterator, QProgressBar)
 
-from core.ffmpeg_runner import FFmpegRunner
-from core.downloader import FFmpegDownloader
+from gui.widgets import DragDropTreeWidget
+from gui.workers import DownloadThread, ProcessingThread
+from core.utils import AppUtils
 
-
-class ProcessingThread(QThread):
-    """將合併運算獨立到背景執行緒，保護 UI 不卡死"""
-    log_signal = pyqtSignal(str)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, tree_data, ffmpeg_path, output_folder):
-        super().__init__()
-        self.tree_data = tree_data
-        self.ffmpeg_path = ffmpeg_path
-        self.output_folder = output_folder
-
-    def run(self):
-        runner = FFmpegRunner(self.ffmpeg_path)
-        
-        for part_name, files in self.tree_data.items():
-            self.log_signal.emit(f"\n⏳ 正在準備 {part_name} 的素材...")
-            
-            ref_video = next((f for f in files if f.upper().endswith('.MP4')), None)
-            if not ref_video:
-                self.log_signal.emit(f"❌ {part_name} 內無影片檔，無法作為轉檔範本，跳過此 Part。")
-                continue
-                
-            ref_info = runner.get_video_info(ref_video)
-            processed_files = []
-            temp_files = []
-            
-            for f in files:
-                if f.upper().endswith(('.JPG', '.PNG', '.JPEG')):
-                    self.log_signal.emit(f"📸 轉換照片中 (3秒): {os.path.basename(f)}")
-                    temp_v = runner.convert_image_to_video(f, ref_info, duration=3)
-                    processed_files.append(temp_v)
-                    temp_files.append(temp_v)
-                else:
-                    processed_files.append(f)
-                    
-            self.log_signal.emit(f"⚙️ 正在合併 {part_name} (共 {len(processed_files)} 個檔案)...")
-            
-            # 若無自訂輸出資料夾，預設儲存於第一個檔案的所在位置
-            out_dir = self.output_folder if self.output_folder else os.path.dirname(files[0])
-            success = runner.merge_videos(part_name, processed_files, out_dir)
-            
-            for tf in temp_files:
-                if os.path.exists(tf):
-                    os.remove(tf)
-                    
-            if success:
-                self.log_signal.emit(f"✅ {part_name} 合併完成！")
-            else:
-                self.log_signal.emit(f"❌ {part_name} 合併失敗。")
-                
-        self.log_signal.emit("\n🎉 所有任務處理完畢！")
-        self.finished_signal.emit()
-
-
-class DragDropTreeWidget(QTreeWidget):
-    def __init__(self):
-        super().__init__()
-        self.setHeaderLabels(["檔案路徑 / 分組 (Part)"])
-        self.setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.setAlternatingRowColors(True)
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.show_context_menu)
-        self.valid_exts = ('.MP4', '.JPG', '.JPEG', '.PNG')
-
-    def show_context_menu(self, position):
-        item = self.itemAt(position)
-        if not item: return
-
-        menu = QMenu()
-        menu.setStyleSheet("QMenu { background-color: #2b2b2b; color: white; border: 1px solid #555; } QMenu::item:selected { background-color: #005A9E; }")
-        
-        is_part = item.parent() is None
-
-        if is_part:
-            rename_action = menu.addAction("✏️ 重新命名 Part")
-            delete_action = menu.addAction("🗑️ 移除此 Part (包含底下檔案)")
-            action = menu.exec(self.viewport().mapToGlobal(position))
-            
-            if action == rename_action:
-                new_name, ok = QInputDialog.getText(self, "重新命名 Part", "請輸入新的名稱:", text=item.text(0))
-                if ok and new_name.strip(): item.setText(0, new_name.strip())
-            elif action == delete_action:
-                self.takeTopLevelItem(self.indexOfTopLevelItem(item))
-        else:
-            open_folder_action = menu.addAction("📂 開啟檔案所在位置")
-            remove_file_action = menu.addAction("❌ 從清單移除")
-            action = menu.exec(self.viewport().mapToGlobal(position))
-            
-            if action == open_folder_action:
-                subprocess.Popen(f'explorer /select,"{item.text(0)}"')
-            elif action == remove_file_action:
-                item.parent().removeChild(item)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls(): event.acceptProposedAction()
-        else: super().dragEnterEvent(event)
-
-    def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls(): event.acceptProposedAction()
-        else: super().dragMoveEvent(event)
-
-    def dropEvent(self, event):
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                path = url.toLocalFile()
-                if os.path.isfile(path) and path.upper().endswith(self.valid_exts):
-                    self.addTopLevelItem(QTreeWidgetItem([path]))
-                elif os.path.isdir(path):
-                    for f in os.listdir(path):
-                        if f.upper().endswith(self.valid_exts):
-                            self.addTopLevelItem(QTreeWidgetItem([os.path.normpath(os.path.join(path, f))]))
-            event.acceptProposedAction()
-        else:
-            super().dropEvent(event)
-
+# 配置全域 Logging 系統
+logging.basicConfig(
+    filename='fishonjuice_merger.log',
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    encoding='utf-8'
+)
 
 class GoProMergerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GoPro Daily Merger - FishOnJuice")
-        self.resize(800, 700)
+        self.resize(800, 800)
+        
         self.current_dir = os.getcwd()
         self.ffmpeg_path = os.path.join(self.current_dir, "ffmpeg.exe")
+        self.ffprobe_path = os.path.join(self.current_dir, "ffprobe.exe")
         self.output_folder = ""
+        
         self.setup_dark_theme()
         self.setup_ui()
+        self.check_dependencies()
+        self.load_settings() # 讀取上次的設定
 
     def setup_dark_theme(self):
         self.setStyleSheet("""
@@ -150,9 +42,12 @@ class GoProMergerApp(QMainWindow):
             QTreeWidget::item:selected { background-color: #005A9E; color: white; }
             QPushButton { background-color: #3d3d3d; color: white; border: 1px solid #555; padding: 6px; border-radius: 3px; font-family: '微軟正黑體'; }
             QPushButton:hover { background-color: #4d4d4d; }
-            QPushButton#actionBtn { background-color: #0078D7; font-weight: bold; }
+            QPushButton#actionBtn { background-color: #0078D7; font-weight: bold; font-size: 14px; padding: 8px;}
             QPushButton#actionBtn:hover { background-color: #1084ea; }
+            QPushButton#downloadBtn { background-color: #c62828; font-weight: bold; }
             QTextEdit { background-color: #1e1e1e; color: #4CAF50; font-family: 'Consolas'; border: 1px solid #3f3f3f;}
+            QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; color: white; }
+            QProgressBar::chunk { background-color: #4CAF50; }
         """)
 
     def setup_ui(self):
@@ -185,31 +80,136 @@ class GoProMergerApp(QMainWindow):
         main_layout.addLayout(list_btn_layout)
 
         output_layout = QHBoxLayout()
-        self.lbl_output = QLabel("輸出資料夾: (預設為原始檔同目錄)")
-        btn_set_output = QPushButton("更改輸出位置")
+        self.lbl_output = QLabel("輸出資料夾: ❌ 尚未設定 (必填)")
+        self.lbl_output.setStyleSheet("color: #ff5252; font-weight: bold;")
+        btn_set_output = QPushButton("設定輸出位置")
         btn_set_output.clicked.connect(self.select_output_folder)
         output_layout.addWidget(self.lbl_output, stretch=1)
         output_layout.addWidget(btn_set_output)
         main_layout.addLayout(output_layout)
+
+        self.btn_download = QPushButton("⚠️ 點此自動下載核心引擎 (FFmpeg / FFprobe)")
+        self.btn_download.setObjectName("downloadBtn")
+        self.btn_download.clicked.connect(self.start_download)
+        self.btn_download.setVisible(False)
+        main_layout.addWidget(self.btn_download)
 
         self.btn_run = QPushButton("啟動功能 (開始合併)")
         self.btn_run.setObjectName("actionBtn")
         self.btn_run.clicked.connect(self.start_processing)
         main_layout.addWidget(self.btn_run)
 
+        progress_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.lbl_eta = QLabel("預估剩餘時間: --")
+        progress_layout.addWidget(self.progress_bar, stretch=4)
+        progress_layout.addWidget(self.lbl_eta, stretch=1)
+        main_layout.addLayout(progress_layout)
+
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
         main_layout.addWidget(self.log_area, stretch=2)
 
-    def log(self, text):
+    def log(self, text, level="INFO"):
         self.log_area.append(text)
         self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
+        # 同步記錄到檔案
+        if level == "INFO": logging.info(text.strip())
+        elif level == "ERROR": logging.error(text.strip())
+
+    def load_settings(self):
+        config = AppUtils.load_config()
+        last_folder = config.get("last_output_folder", "")
+        if last_folder and os.path.exists(last_folder):
+            self.output_folder = last_folder
+            self.lbl_output.setText(f"輸出資料夾: {self.output_folder}")
+            self.lbl_output.setStyleSheet("color: #4CAF50; font-weight: bold;")
 
     def select_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "選擇輸出資料夾")
         if folder:
             self.output_folder = folder
             self.lbl_output.setText(f"輸出資料夾: {self.output_folder}")
+            self.lbl_output.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            # 儲存設定
+            AppUtils.save_config({"last_output_folder": self.output_folder})
+
+    def start_processing(self):
+        if not self.output_folder:
+            QMessageBox.warning(self, "操作錯誤", "請先設定「輸出資料夾」！")
+            return
+
+        # --- 磁碟空間預檢 ---
+        total_size_bytes = 0
+        tree_data = {}
+        for i in range(self.tree.topLevelItemCount()):
+            part_item = self.tree.topLevelItem(i)
+            files = []
+            for j in range(part_item.childCount()):
+                f_path = part_item.child(j).text(0)
+                files.append(f_path)
+                total_size_bytes += os.path.getsize(f_path)
+            if files: tree_data[part_item.text(0)] = files
+
+        if not tree_data:
+            self.log("⚠️ 清單中沒有可處理的檔案。")
+            return
+
+        free_gb = AppUtils.get_free_space_gb(self.output_folder)
+        required_gb = total_size_bytes / (1024**3)
+        
+        # 預留 2GB 安全空間
+        if free_gb < (required_gb + 2):
+            QMessageBox.critical(self, "硬碟空間不足", 
+                               f"目標硬碟空間不足！\n\n需要：約 {required_gb:.2f} GB\n剩餘：{free_gb:.2f} GB\n\n請清理空間或更換輸出資料夾。")
+            return
+
+        self.btn_run.setEnabled(False)
+        self.btn_run.setText("處理中...")
+        self.log(f"🚀 開始合併任務，預計總產出大小：{required_gb:.2f} GB")
+        
+        self.process_thread = ProcessingThread(tree_data, self.ffmpeg_path, self.output_folder)
+        self.process_thread.log_signal.connect(self.log)
+        self.process_thread.progress_signal.connect(self.update_progress)
+        self.process_thread.finished_signal.connect(self.on_process_finished)
+        self.process_thread.start()
+
+    # (其餘 check_dependencies, start_download, closeEvent 等保持不變...)
+    def on_process_finished(self):
+        self.btn_run.setEnabled(True)
+        self.btn_run.setText("啟動功能 (開始合併)")
+
+    def update_progress(self, percent, eta_str):
+        self.progress_bar.setValue(percent)
+        self.lbl_eta.setText(f"預計剩餘: {eta_str}")
+
+    def check_dependencies(self):
+        if os.path.exists(self.ffmpeg_path) and os.path.exists(self.ffprobe_path):
+            self.btn_download.setVisible(False)
+            self.btn_run.setEnabled(True)
+            self.btn_run.setText("啟動功能 (開始合併)")
+            self.log("✅ 系統環境檢查完畢，核心引擎已就緒。")
+        else:
+            self.btn_download.setVisible(True)
+            self.btn_run.setEnabled(False)
+            self.btn_run.setText("請先安裝核心引擎")
+            self.log("⚠️ 偵測不到核心引擎，請點擊上方按鈕下載。")
+
+    def start_download(self):
+        self.btn_download.setEnabled(False)
+        self.btn_download.setText("⏳ 下載與安裝中...")
+        self.log_area.clear()
+        self.dl_thread = DownloadThread(self.current_dir)
+        self.dl_thread.log_signal.connect(self.log)
+        self.dl_thread.finished_signal.connect(self.on_download_finished)
+        self.dl_thread.start()
+
+    def on_download_finished(self, success):
+        if success: self.check_dependencies()
+        else:
+            self.btn_download.setEnabled(True)
+            self.btn_download.setText("⚠️ 下載失敗，點此重試")
 
     def add_manual_part(self):
         part_item = QTreeWidgetItem([f"Part_{datetime.datetime.now().strftime('%H%M%S')}"])
@@ -242,47 +242,22 @@ class GoProMergerApp(QMainWindow):
                 groups.setdefault('未分類', []).append(file_path)
 
         for date_key, files in groups.items():
-            if date_key != '未分類':
-                files.sort(key=lambda x: (os.path.basename(x)[4:8], os.path.basename(x)[2:4]) if os.path.basename(x).upper().endswith('.MP4') and len(os.path.basename(x)) >= 12 else (x, ""))
-            
             part_item = QTreeWidgetItem([f"Part_{date_key}"])
             part_item.setExpanded(True)
             self.tree.addTopLevelItem(part_item)
+            # 初始分類時直接調用智慧排序
+            files.sort(key=lambda x: (os.path.basename(x)[4:8], os.path.basename(x)[2:4]) if os.path.basename(x).upper().startswith('GX') else (os.path.getmtime(x)))
             for file_path in files:
                 part_item.addChild(QTreeWidgetItem([file_path]))
 
-    def start_processing(self):
-        self.btn_run.setEnabled(False)
-        if not os.path.exists(self.ffmpeg_path):
-            if QMessageBox.askyesno("缺少核心組件", "是否由 FishOnJuice 自動下載 FFmpeg 與 FFprobe？"):
-                self.log("🌐 準備下載核心引擎...")
-                import threading
-                threading.Thread(target=self.download_and_then_process, daemon=True).start()
-            else:
-                self.btn_run.setEnabled(True)
-            return
-            
-        tree_data = {}
-        for i in range(self.tree.topLevelItemCount()):
-            part_item = self.tree.topLevelItem(i)
-            files = [part_item.child(j).text(0) for j in range(part_item.childCount())]
-            if files: tree_data[part_item.text(0)] = files
-
-        if not tree_data:
-            self.log("⚠️ 清單中沒有可處理的檔案。")
-            self.btn_run.setEnabled(True)
-            return
-
-        self.log("🚀 開始處理佇列...")
-        self.thread = ProcessingThread(tree_data, self.ffmpeg_path, self.output_folder)
-        self.thread.log_signal.connect(self.log)
-        self.thread.finished_signal.connect(lambda: self.btn_run.setEnabled(True))
-        self.thread.start()
-
-    def download_and_then_process(self):
-        downloader = FFmpegDownloader()
-        def log_callback(msg): self.log(msg)
-        if downloader.download_and_extract(self.current_dir, log_callback):
-            self.start_processing()
-        else:
-            self.btn_run.setEnabled(True)
+    def closeEvent(self, event):
+        is_processing = hasattr(self, 'process_thread') and self.process_thread.isRunning()
+        if is_processing:
+            reply = QMessageBox.question(self, '警告', '正在合併影片中，確定要中斷並退出？', 
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.process_thread.cancel()
+                self.process_thread.wait(2000)
+                event.accept()
+            else: event.ignore()
+        else: event.accept()
