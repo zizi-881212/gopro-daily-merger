@@ -245,8 +245,14 @@ class GoProMergerApp(QMainWindow):
             part_item = QTreeWidgetItem([f"Part_{date_key}"])
             part_item.setExpanded(True)
             self.tree.addTopLevelItem(part_item)
-            # 初始分類時直接調用智慧排序
-            files.sort(key=lambda x: (os.path.basename(x)[4:8], os.path.basename(x)[2:4]) if os.path.basename(x).upper().startswith('GX') else (os.path.getmtime(x)))
+            
+            # 🐛 修正排序 Bug：統一回傳 (優先權, 排序條件1, 排序條件2) 避免 Tuple 與 Float 互相比較
+            files.sort(
+                key=lambda x: (0, os.path.basename(x)[4:8], os.path.basename(x)[2:4]) 
+                if (os.path.basename(x).upper().startswith('GX') and len(os.path.basename(x)) >= 12) 
+                else (1, os.path.getmtime(x), os.path.basename(x))
+            )
+            
             for file_path in files:
                 part_item.addChild(QTreeWidgetItem([file_path]))
 

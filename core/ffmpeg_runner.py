@@ -20,7 +20,8 @@ class FFmpegRunner:
     def get_video_info(self, reference_video):
         cmd = [
             self.ffprobe_path, "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,r_frame_rate,pix_fmt",
+            # 新增讀取 codec_name (編碼格式)
+            "-show_entries", "stream=width,height,r_frame_rate,pix_fmt,codec_name",
             "-of", "json", reference_video
         ]
         try:
@@ -31,10 +32,31 @@ class FFmpegRunner:
                 "width": stream.get('width', 1920),
                 "height": stream.get('height', 1080),
                 "fps": stream.get('r_frame_rate', '60/1'),
-                "pix_fmt": stream.get('pix_fmt', 'yuvj420p')
+                "pix_fmt": stream.get('pix_fmt', 'yuvj420p'),
+                "codec_name": stream.get('codec_name', 'hevc') # 預設假設為 hevc
             }
         except Exception:
-            return {"width": 1920, "height": 1080, "fps": "60/1", "pix_fmt": "yuvj420p"}
+            return {"width": 1920, "height": 1080, "fps": "60/1", "pix_fmt": "yuvj420p", "codec_name": "hevc"}
+
+    def verify_video_compatibility(self, file_paths, ref_info):
+        """事前檢查所有影片規格是否與基準影片一致"""
+        for f in file_paths:
+            # 照片會被我們動態轉碼成跟基準影片一樣，所以直接 Pass
+            if f.upper().endswith(('.JPG', '.PNG', '.JPEG')):
+                continue
+                
+            info = self.get_video_info(f)
+            filename = os.path.basename(f)
+            
+            # 檢查 1：解析度是否一致
+            if info['width'] != ref_info['width'] or info['height'] != ref_info['height']:
+                return False, f"解析度不符: {filename} ({info['width']}x{info['height']} vs 基準 {ref_info['width']}x{ref_info['height']})"
+            
+            # 檢查 2：編碼器是否一致 (例如 h264 不能跟 hevc 直接無損合併)
+            if info['codec_name'] != ref_info['codec_name']:
+                return False, f"編碼格式不符: {filename} ({info['codec_name']} vs 基準 {ref_info['codec_name']})"
+            
+        return True, ""
 
     def get_video_duration(self, video_path):
         cmd = [
@@ -67,7 +89,7 @@ class FFmpegRunner:
         self.current_process.communicate()
         return temp_video_path
 
-    def merge_videos(self, part_name, file_paths, output_folder, total_duration=0, progress_callback=None):
+    def merge_videos(self, part_name, file_paths, output_folder, total_duration=0, progress_callback=None, metadata_path=None):
         if not file_paths:
             return False
             
@@ -84,15 +106,23 @@ class FFmpegRunner:
             cmd = [
                 self.ffmpeg_path, "-y",                 
                 "-f", "concat", "-safe", "0",         
-                "-i", list_path, "-c", "copy",
-                "-progress", "-", "-nostats",
-                output_path           
+                "-i", list_path
             ]
             
-            # 使用 Popen 並紀錄進程
+            # 如果有傳入 Metadata 檔案，就加入指令中一併封裝
+            if metadata_path and os.path.exists(metadata_path):
+                cmd.extend(["-i", metadata_path, "-map_metadata", "1"])
+                
+            cmd.extend([
+                "-c", "copy",
+                "-progress", "-", "-nostats",
+                output_path
+            ])
+            
             self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
             
             start_time = time.time()
+            last_few_lines = []
             
             for line in self.current_process.stdout:
                 if "out_time_us=" in line:
@@ -110,9 +140,20 @@ class FFmpegRunner:
                                 progress_callback(percent, eta_seconds)
                     except ValueError:
                         pass
+                else:
+                    if line.strip():
+                        last_few_lines.append(line.strip())
+                        if len(last_few_lines) > 10:
+                            last_few_lines.pop(0)
 
             self.current_process.wait()
-            return self.current_process.returncode == 0
+            
+            if self.current_process.returncode != 0:
+                error_reason = "\n".join(last_few_lines)
+                print(f"FFmpeg 合併崩潰，最後的錯誤訊息:\n{error_reason}")
+                return False
+            
+            return True
                 
         except Exception as e:
             print(f"Merge Error: {e}")

@@ -1,2 +1,5 @@
 ffmpeg.exe
 __pycache__/
+ffprobe.exe
+fishonjuice_merger.log
+config.json
