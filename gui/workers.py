@@ -38,31 +38,49 @@ class ProcessingThread(QThread):
     def run(self):
         self.runner = FFmpegRunner(self.ffmpeg_path)
         
+        # ==========================================
+        # 階段一：全局掃雷 (Global Pre-flight Check)
+        # ==========================================
+        self.log_signal.emit("\n🔎 正在進行全局素材掃雷與規格檢查...")
+        self.progress_signal.emit(0, "掃雷中...")
+        
+        for part_name, files in self.tree_data.items():
+            if self.is_cancelled: return
+            
+            ref_video = next((f for f in files if f.upper().endswith('.MP4')), None)
+            if not ref_video:
+                self.log_signal.emit(f"⚠️ {part_name} 內無影片檔，將在合併時跳過此 Part。")
+                continue
+                
+            ref_info = self.runner.get_video_info(ref_video)
+            is_compatible, error_msg = self.runner.verify_video_compatibility(files, ref_info)
+            
+            if not is_compatible:
+                self.log_signal.emit(f"❌ 掃雷失敗！在 {part_name} 發現致命問題：\n   原因：{error_msg}")
+                self.log_signal.emit("🛑 為保護資料安全，已阻擋本次合併任務。請於清單中移除異常檔案後再試。")
+                self.progress_signal.emit(0, "任務已阻擋")
+                self.finished_signal.emit()
+                return # 只要全域發現任何一顆地雷，整個任務直接打回票！
+                
+        if self.is_cancelled: return
+        self.log_signal.emit("✅ 全局掃雷通過！所有素材皆安全無虞，準備開始正式處理。\n" + "-"*40)
+        
+        # ==========================================
+        # 階段二：正式處理與合併
+        # ==========================================
         for part_name, files in self.tree_data.items():
             if self.is_cancelled: break
             
             self.log_signal.emit(f"\n⏳ 正在準備 {part_name} 的素材...")
-            self.progress_signal.emit(0, "檢查規格中...")
             
             ref_video = next((f for f in files if f.upper().endswith('.MP4')), None)
-            if not ref_video:
-                self.log_signal.emit(f"❌ {part_name} 內無影片檔，無法作為轉檔範本，跳過此 Part。")
-                continue
-                
+            if not ref_video: continue
             ref_info = self.runner.get_video_info(ref_video)
-            
-            is_compatible, error_msg = self.runner.verify_video_compatibility(files, ref_info)
-            if not is_compatible:
-                self.log_signal.emit(f"❌ {part_name} 規格檢查失敗，無法進行無損合併！\n   原因：{error_msg}")
-                self.log_signal.emit("💡 提示：請確保同一個 Part 內的影片解析度與編碼皆相同。")
-                continue 
-                
-            self.log_signal.emit("✅ 規格檢查通過，素材基因一致！")
             
             processed_files = []
             temp_files = []
             total_duration = 0.0
-            chapters_info = [] # 新增：用來記錄章節的時間點與檔名
+            chapters_info = [] 
             
             for f in files:
                 if self.is_cancelled: break
@@ -84,31 +102,26 @@ class ProcessingThread(QThread):
             if self.is_cancelled: break
             
             out_dir = self.output_folder if self.output_folder else os.path.dirname(files[0])
-            
-            # --- 新增：自動產生 YouTube 章節文字檔與 FFmpeg 內部封裝用的元數據檔 ---
             yt_txt_path = os.path.join(out_dir, f"{part_name}_YT章節.txt")
             meta_txt_path = os.path.join(out_dir, f"{part_name}_meta.txt")
-            temp_files.append(meta_txt_path) # 將 meta_txt 加入暫存清單，確保合併後自動刪除
+            temp_files.append(meta_txt_path) 
             
             try:
                 with open(yt_txt_path, 'w', encoding='utf-8') as yt_f, open(meta_txt_path, 'w', encoding='utf-8') as meta_f:
                     meta_f.write(";FFMETADATA1\n")
                     for start_sec, dur, title in chapters_info:
-                        # 格式化 YT 時間軸 (MM:SS 或 HH:MM:SS)
                         h = int(start_sec // 3600)
                         m = int((start_sec % 3600) // 60)
                         s = int(start_sec % 60)
                         time_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
                         yt_f.write(f"{time_str} - {title}\n")
                         
-                        # 寫入底層 Metadata 格式 (以毫秒為單位)
                         start_ms = int(start_sec * 1000)
                         end_ms = int((start_sec + dur) * 1000)
                         meta_f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start_ms}\nEND={end_ms}\ntitle={title}\n")
                 self.log_signal.emit(f"📝 已產生 YouTube 資訊欄時間軸：{os.path.basename(yt_txt_path)}")
             except Exception as e:
                 self.log_signal.emit(f"⚠️ 產生章節資訊時發生錯誤: {e}")
-            # -------------------------------------------------------------------------
 
             self.log_signal.emit(f"⚙️ 正在合併 {part_name} (總時長約 {int(total_duration)} 秒)...")
             
@@ -116,8 +129,7 @@ class ProcessingThread(QThread):
                 eta_str = f"{int(eta)} 秒" if eta < 60 else f"{int(eta//60)} 分 {int(eta%60)} 秒"
                 self.progress_signal.emit(percent, eta_str)
             
-            # 將 metadata_path 傳入 FFmpegRunner
-            success = self.runner.merge_videos(part_name, processed_files, out_dir, total_duration, progress_cb, metadata_path=meta_txt_path)
+            success, err_msg = self.runner.merge_videos(part_name, processed_files, out_dir, total_duration, progress_cb, metadata_path=meta_txt_path)
             
             if not self.is_cancelled:
                 self.progress_signal.emit(100, "完成")
@@ -129,10 +141,10 @@ class ProcessingThread(QThread):
             if success and not self.is_cancelled:
                 self.log_signal.emit(f"✅ {part_name} 合併完成！")
             elif not self.is_cancelled:
-                self.log_signal.emit(f"❌ {part_name} 合併失敗。")
+                self.log_signal.emit(f"❌ {part_name} 合併失敗。\n   詳細原因：{err_msg}")
                 
         if self.is_cancelled:
-            self.log_signal.emit("\n🛑 任務已強制中斷！")
+            self.log_signal.emit("\n🛑 任務已由使用者強制中斷！")
         else:
             self.log_signal.emit("\n🎉 所有任務處理完畢！")
             

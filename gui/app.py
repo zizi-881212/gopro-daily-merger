@@ -4,6 +4,7 @@ import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
                              QTextEdit, QTreeWidgetItem, QTreeWidgetItemIterator, QProgressBar)
+from PyQt6.QtCore import Qt
 
 from gui.widgets import DragDropTreeWidget
 from gui.workers import DownloadThread, ProcessingThread
@@ -94,10 +95,21 @@ class GoProMergerApp(QMainWindow):
         self.btn_download.setVisible(False)
         main_layout.addWidget(self.btn_download)
 
+        # --- 新增：將啟動與中斷按鈕放在同一排 ---
+        action_layout = QHBoxLayout()
         self.btn_run = QPushButton("啟動功能 (開始合併)")
         self.btn_run.setObjectName("actionBtn")
         self.btn_run.clicked.connect(self.start_processing)
-        main_layout.addWidget(self.btn_run)
+        
+        self.btn_cancel = QPushButton("🛑 中斷任務")
+        self.btn_cancel.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 14px; padding: 8px; border-radius: 3px;")
+        self.btn_cancel.setEnabled(False) # 預設反灰不能按
+        self.btn_cancel.clicked.connect(self.cancel_processing)
+        
+        action_layout.addWidget(self.btn_run, stretch=3)
+        action_layout.addWidget(self.btn_cancel, stretch=1)
+        main_layout.addLayout(action_layout)
+        # ----------------------------------------
 
         progress_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
@@ -135,12 +147,21 @@ class GoProMergerApp(QMainWindow):
             # 儲存設定
             AppUtils.save_config({"last_output_folder": self.output_folder})
 
+    def cancel_processing(self):
+        """按下中斷按鈕時觸發"""
+        if hasattr(self, 'process_thread') and self.process_thread.isRunning():
+            reply = QMessageBox.question(self, '確認', '確定要強制中斷目前的合併任務嗎？', 
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.btn_cancel.setEnabled(False)
+                self.btn_cancel.setText("中斷中...")
+                self.process_thread.cancel()
+
     def start_processing(self):
         if not self.output_folder:
             QMessageBox.warning(self, "操作錯誤", "請先設定「輸出資料夾」！")
             return
 
-        # --- 磁碟空間預檢 ---
         total_size_bytes = 0
         tree_data = {}
         for i in range(self.tree.topLevelItemCount()):
@@ -159,15 +180,18 @@ class GoProMergerApp(QMainWindow):
         free_gb = AppUtils.get_free_space_gb(self.output_folder)
         required_gb = total_size_bytes / (1024**3)
         
-        # 預留 2GB 安全空間
         if free_gb < (required_gb + 2):
             QMessageBox.critical(self, "硬碟空間不足", 
                                f"目標硬碟空間不足！\n\n需要：約 {required_gb:.2f} GB\n剩餘：{free_gb:.2f} GB\n\n請清理空間或更換輸出資料夾。")
             return
 
+        # 切換按鈕狀態
         self.btn_run.setEnabled(False)
         self.btn_run.setText("處理中...")
-        self.log(f"🚀 開始合併任務，預計總產出大小：{required_gb:.2f} GB")
+        self.btn_cancel.setEnabled(True)
+        self.btn_cancel.setText("🛑 中斷任務")
+        
+        self.log(f"🚀 開始任務，預計總產出大小：{required_gb:.2f} GB")
         
         self.process_thread = ProcessingThread(tree_data, self.ffmpeg_path, self.output_folder)
         self.process_thread.log_signal.connect(self.log)
@@ -175,10 +199,12 @@ class GoProMergerApp(QMainWindow):
         self.process_thread.finished_signal.connect(self.on_process_finished)
         self.process_thread.start()
 
-    # (其餘 check_dependencies, start_download, closeEvent 等保持不變...)
     def on_process_finished(self):
+        # 任務結束後恢復按鈕狀態
         self.btn_run.setEnabled(True)
         self.btn_run.setText("啟動功能 (開始合併)")
+        self.btn_cancel.setEnabled(False)
+        self.btn_cancel.setText("🛑 中斷任務")
 
     def update_progress(self, percent, eta_str):
         self.progress_bar.setValue(percent)
@@ -246,15 +272,21 @@ class GoProMergerApp(QMainWindow):
             part_item.setExpanded(True)
             self.tree.addTopLevelItem(part_item)
             
-            # 🐛 修正排序 Bug：統一回傳 (優先權, 排序條件1, 排序條件2) 避免 Tuple 與 Float 互相比較
-            files.sort(
-                key=lambda x: (0, os.path.basename(x)[4:8], os.path.basename(x)[2:4]) 
-                if (os.path.basename(x).upper().startswith('GX') and len(os.path.basename(x)) >= 12) 
-                else (1, os.path.getmtime(x), os.path.basename(x))
-            )
+            # 💡 更新排序邏輯：加入 GOPR 照片的流水號判斷
+            def custom_sort(filepath):
+                fname = os.path.basename(filepath).upper()
+                if fname.startswith('GX') and len(fname) >= 12:
+                    return (0, fname[4:8], fname[2:4]) # (優先權, 流水號, 章節)
+                elif fname.startswith('GOPR') and len(fname) >= 12:
+                    return (0, fname[4:8], '00')       # 照片章節設為 '00'，會排在同號碼影片的前面
+                return (1, os.path.getmtime(filepath), fname) # 其他設備檔案 (如 iPhone) 依時間排序
+                
+            files.sort(key=custom_sort)
             
             for file_path in files:
-                part_item.addChild(QTreeWidgetItem([file_path]))
+                child_item = QTreeWidgetItem([file_path])
+                child_item.setFlags(child_item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+                part_item.addChild(child_item)
 
     def closeEvent(self, event):
         is_processing = hasattr(self, 'process_thread') and self.process_thread.isRunning()

@@ -68,12 +68,14 @@ class DragDropTreeWidget(QTreeWidget):
         for i in range(part_item.childCount()):
             children.append(part_item.takeChild(0))
         
-        # 排序邏輯：優先處理 GoPro 命名規則，其餘依修改時間
+        # 💡 排序邏輯：優先處理 GoPro (GX影片與GOPR照片) 命名規則，其餘依修改時間
         def sort_key(child):
             path = child.text(0)
             fname = os.path.basename(path).upper()
             if fname.startswith('GX') and len(fname) >= 12:
-                return (0, fname[4:8], fname[2:4]) # 群組ID, 章節
+                return (0, fname[4:8], fname[2:4])
+            elif fname.startswith('GOPR') and len(fname) >= 12:
+                return (0, fname[4:8], '00')
             return (1, os.path.getmtime(path), fname)
         
         children.sort(key=sort_key)
@@ -104,10 +106,16 @@ class DragDropTreeWidget(QTreeWidget):
             for url in event.mimeData().urls():
                 path = url.toLocalFile()
                 if os.path.isfile(path) and path.upper().endswith(self.valid_exts):
-                    self.addTopLevelItem(QTreeWidgetItem([path]))
+                    item = QTreeWidgetItem([path])
+                    # 💡 移除「允許被放置」的屬性，讓檔案不能變成資料夾
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+                    self.addTopLevelItem(item)
                 elif os.path.isdir(path):
                     for f in os.listdir(path):
                         if f.upper().endswith(self.valid_exts):
-                            self.addTopLevelItem(QTreeWidgetItem([os.path.normpath(os.path.join(path, f))]))
+                            item = QTreeWidgetItem([os.path.normpath(os.path.join(path, f))])
+                            # 💡 移除「允許被放置」的屬性
+                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
+                            self.addTopLevelItem(item)
             event.acceptProposedAction()
         else: super().dropEvent(event)

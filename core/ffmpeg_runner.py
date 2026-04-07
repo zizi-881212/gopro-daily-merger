@@ -39,7 +39,7 @@ class FFmpegRunner:
             return {"width": 1920, "height": 1080, "fps": "60/1", "pix_fmt": "yuvj420p", "codec_name": "hevc"}
 
     def verify_video_compatibility(self, file_paths, ref_info):
-        """事前檢查所有影片規格是否與基準影片一致"""
+        """事前檢查所有影片規格是否與基準影片一致，並排除損毀或 0 秒異常檔"""
         for f in file_paths:
             # 照片會被我們動態轉碼成跟基準影片一樣，所以直接 Pass
             if f.upper().endswith(('.JPG', '.PNG', '.JPEG')):
@@ -48,11 +48,16 @@ class FFmpegRunner:
             info = self.get_video_info(f)
             filename = os.path.basename(f)
             
-            # 檢查 1：解析度是否一致
+            # 檢查 1：影片長度是否異常 (防禦 0 秒快門或損毀檔)
+            duration = self.get_video_duration(f)
+            if duration <= 0:
+                return False, f"偵測到異常檔案 (長度為 0 秒或檔案損毀): {filename}"
+            
+            # 檢查 2：解析度是否一致
             if info['width'] != ref_info['width'] or info['height'] != ref_info['height']:
                 return False, f"解析度不符: {filename} ({info['width']}x{info['height']} vs 基準 {ref_info['width']}x{ref_info['height']})"
             
-            # 檢查 2：編碼器是否一致 (例如 h264 不能跟 hevc 直接無損合併)
+            # 檢查 3：編碼器是否一致 (例如 h264 不能跟 hevc 直接無損合併)
             if info['codec_name'] != ref_info['codec_name']:
                 return False, f"編碼格式不符: {filename} ({info['codec_name']} vs 基準 {ref_info['codec_name']})"
             
@@ -91,7 +96,7 @@ class FFmpegRunner:
 
     def merge_videos(self, part_name, file_paths, output_folder, total_duration=0, progress_callback=None, metadata_path=None):
         if not file_paths:
-            return False
+            return False, "無檔案可合併"
             
         output_filename = f"{part_name}_merged.mp4"
         output_path = os.path.join(output_folder, output_filename)
@@ -109,11 +114,12 @@ class FFmpegRunner:
                 "-i", list_path
             ]
             
-            # 如果有傳入 Metadata 檔案，就加入指令中一併封裝
             if metadata_path and os.path.exists(metadata_path):
                 cmd.extend(["-i", metadata_path, "-map_metadata", "1"])
                 
             cmd.extend([
+                "-map", "0:v", 
+                "-map", "0:a", 
                 "-c", "copy",
                 "-progress", "-", "-nostats",
                 output_path
@@ -150,14 +156,13 @@ class FFmpegRunner:
             
             if self.current_process.returncode != 0:
                 error_reason = "\n".join(last_few_lines)
-                print(f"FFmpeg 合併崩潰，最後的錯誤訊息:\n{error_reason}")
-                return False
+                # 💡 修正：不再用 print，而是直接把錯誤訊息 return 給上層
+                return False, f"FFmpeg 底層崩潰:\n{error_reason}"
             
-            return True
+            return True, ""
                 
         except Exception as e:
-            print(f"Merge Error: {e}")
-            return False
+            return False, f"Python 執行期例外錯誤: {str(e)}"
         finally:
             if os.path.exists(list_path):
                 os.remove(list_path)
