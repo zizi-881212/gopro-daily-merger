@@ -1,7 +1,9 @@
 import os
 from PyQt6.QtCore import QThread, pyqtSignal
+
 from core.ffmpeg_runner import FFmpegRunner
 from core.downloader import FFmpegDownloader
+from core.chapter_builder import ChapterBuilder
 
 class DownloadThread(QThread):
     log_signal = pyqtSignal(str)
@@ -30,7 +32,6 @@ class ProcessingThread(QThread):
         self.runner = None
 
     def cancel(self):
-        """接收外部中斷訊號，並轉傳給底層的 FFmpegRunner"""
         self.is_cancelled = True
         if self.runner:
             self.runner.cancel()
@@ -38,9 +39,7 @@ class ProcessingThread(QThread):
     def run(self):
         self.runner = FFmpegRunner(self.ffmpeg_path)
         
-        # ==========================================
-        # 階段一：全局掃雷 (Global Pre-flight Check)
-        # ==========================================
+        # === 階段一：全局掃雷 ===
         self.log_signal.emit("\n🔎 正在進行全局素材掃雷與規格檢查...")
         self.progress_signal.emit(0, "掃雷中...")
         
@@ -60,14 +59,12 @@ class ProcessingThread(QThread):
                 self.log_signal.emit("🛑 為保護資料安全，已阻擋本次合併任務。請於清單中移除異常檔案後再試。")
                 self.progress_signal.emit(0, "任務已阻擋")
                 self.finished_signal.emit()
-                return # 只要全域發現任何一顆地雷，整個任務直接打回票！
+                return 
                 
         if self.is_cancelled: return
         self.log_signal.emit("✅ 全局掃雷通過！所有素材皆安全無虞，準備開始正式處理。\n" + "-"*40)
         
-        # ==========================================
-        # 階段二：正式處理與合併
-        # ==========================================
+        # === 階段二：正式處理與合併 ===
         for part_name, files in self.tree_data.items():
             if self.is_cancelled: break
             
@@ -102,26 +99,14 @@ class ProcessingThread(QThread):
             if self.is_cancelled: break
             
             out_dir = self.output_folder if self.output_folder else os.path.dirname(files[0])
-            yt_txt_path = os.path.join(out_dir, f"{part_name}_YT章節.txt")
-            meta_txt_path = os.path.join(out_dir, f"{part_name}_meta.txt")
-            temp_files.append(meta_txt_path) 
             
-            try:
-                with open(yt_txt_path, 'w', encoding='utf-8') as yt_f, open(meta_txt_path, 'w', encoding='utf-8') as meta_f:
-                    meta_f.write(";FFMETADATA1\n")
-                    for start_sec, dur, title in chapters_info:
-                        h = int(start_sec // 3600)
-                        m = int((start_sec % 3600) // 60)
-                        s = int(start_sec % 60)
-                        time_str = f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
-                        yt_f.write(f"{time_str} - {title}\n")
-                        
-                        start_ms = int(start_sec * 1000)
-                        end_ms = int((start_sec + dur) * 1000)
-                        meta_f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={start_ms}\nEND={end_ms}\ntitle={title}\n")
-                self.log_signal.emit(f"📝 已產生 YouTube 資訊欄時間軸：{os.path.basename(yt_txt_path)}")
-            except Exception as e:
-                self.log_signal.emit(f"⚠️ 產生章節資訊時發生錯誤: {e}")
+            # 💡 委託 Builder 生成文字檔
+            success, msg, meta_txt_path = ChapterBuilder.build(chapters_info, out_dir, part_name)
+            if success:
+                temp_files.append(meta_txt_path)
+                self.log_signal.emit(f"📝 已產生 YouTube 資訊欄時間軸：{os.path.basename(msg)}")
+            else:
+                self.log_signal.emit(f"⚠️ 產生章節資訊時發生錯誤: {msg}")
 
             self.log_signal.emit(f"⚙️ 正在合併 {part_name} (總時長約 {int(total_duration)} 秒)...")
             

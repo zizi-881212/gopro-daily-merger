@@ -3,6 +3,8 @@ import subprocess
 from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView, QMenu, QInputDialog
 from PyQt6.QtCore import Qt
 
+from core.parser import GoProParser
+
 class DragDropTreeWidget(QTreeWidget):
     def __init__(self):
         super().__init__()
@@ -68,17 +70,8 @@ class DragDropTreeWidget(QTreeWidget):
         for i in range(part_item.childCount()):
             children.append(part_item.takeChild(0))
         
-        # 💡 排序邏輯：優先處理 GoPro (GX影片與GOPR照片) 命名規則，其餘依修改時間
-        def sort_key(child):
-            path = child.text(0)
-            fname = os.path.basename(path).upper()
-            if fname.startswith('GX') and len(fname) >= 12:
-                return (0, fname[4:8], fname[2:4])
-            elif fname.startswith('GOPR') and len(fname) >= 12:
-                return (0, fname[4:8], '00')
-            return (1, os.path.getmtime(path), fname)
-        
-        children.sort(key=sort_key)
+        # 💡 將排序職責委託給核心的 Parser
+        children.sort(key=lambda child: GoProParser.get_sort_key(child.text(0)))
         part_item.addChildren(children)
 
     def batch_delete(self, selected_items):
@@ -107,14 +100,12 @@ class DragDropTreeWidget(QTreeWidget):
                 path = url.toLocalFile()
                 if os.path.isfile(path) and path.upper().endswith(self.valid_exts):
                     item = QTreeWidgetItem([path])
-                    # 💡 移除「允許被放置」的屬性，讓檔案不能變成資料夾
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
                     self.addTopLevelItem(item)
                 elif os.path.isdir(path):
                     for f in os.listdir(path):
                         if f.upper().endswith(self.valid_exts):
                             item = QTreeWidgetItem([os.path.normpath(os.path.join(path, f))])
-                            # 💡 移除「允許被放置」的屬性
                             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsDropEnabled)
                             self.addTopLevelItem(item)
             event.acceptProposedAction()

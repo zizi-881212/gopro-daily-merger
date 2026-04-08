@@ -1,5 +1,4 @@
 import os
-import datetime
 import logging
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QFileDialog, QMessageBox, 
@@ -9,6 +8,7 @@ from PyQt6.QtCore import Qt
 from gui.widgets import DragDropTreeWidget
 from gui.workers import DownloadThread, ProcessingThread
 from core.utils import AppUtils
+from core.parser import GoProParser
 
 # 配置全域 Logging 系統
 logging.basicConfig(
@@ -32,7 +32,7 @@ class GoProMergerApp(QMainWindow):
         self.setup_dark_theme()
         self.setup_ui()
         self.check_dependencies()
-        self.load_settings() # 讀取上次的設定
+        self.load_settings()
 
     def setup_dark_theme(self):
         self.setStyleSheet("""
@@ -69,24 +69,26 @@ class GoProMergerApp(QMainWindow):
         main_layout.addWidget(self.tree, stretch=5)
 
         list_btn_layout = QHBoxLayout()
-        btn_auto_sort = QPushButton("GoPro 自動分類 (依日期)")
-        btn_auto_sort.clicked.connect(self.auto_categorize)
-        btn_add_part = QPushButton("新增空白 Part")
-        btn_add_part.clicked.connect(self.add_manual_part)
-        btn_clear = QPushButton("清除清單")
-        btn_clear.clicked.connect(self.tree.clear)
-        list_btn_layout.addWidget(btn_auto_sort)
-        list_btn_layout.addWidget(btn_add_part)
-        list_btn_layout.addWidget(btn_clear)
+        # 💡 加上 self. 前綴，方便後續鎖定 UI
+        self.btn_auto_sort = QPushButton("GoPro 自動分類 (依日期)")
+        self.btn_auto_sort.clicked.connect(self.auto_categorize)
+        self.btn_add_part = QPushButton("新增空白 Part")
+        self.btn_add_part.clicked.connect(self.add_manual_part)
+        self.btn_clear = QPushButton("清除清單")
+        self.btn_clear.clicked.connect(self.tree.clear)
+        list_btn_layout.addWidget(self.btn_auto_sort)
+        list_btn_layout.addWidget(self.btn_add_part)
+        list_btn_layout.addWidget(self.btn_clear)
         main_layout.addLayout(list_btn_layout)
 
         output_layout = QHBoxLayout()
         self.lbl_output = QLabel("輸出資料夾: ❌ 尚未設定 (必填)")
         self.lbl_output.setStyleSheet("color: #ff5252; font-weight: bold;")
-        btn_set_output = QPushButton("設定輸出位置")
-        btn_set_output.clicked.connect(self.select_output_folder)
+        # 💡 加上 self. 前綴
+        self.btn_set_output = QPushButton("設定輸出位置")
+        self.btn_set_output.clicked.connect(self.select_output_folder)
         output_layout.addWidget(self.lbl_output, stretch=1)
-        output_layout.addWidget(btn_set_output)
+        output_layout.addWidget(self.btn_set_output)
         main_layout.addLayout(output_layout)
 
         self.btn_download = QPushButton("⚠️ 點此自動下載核心引擎 (FFmpeg / FFprobe)")
@@ -95,7 +97,6 @@ class GoProMergerApp(QMainWindow):
         self.btn_download.setVisible(False)
         main_layout.addWidget(self.btn_download)
 
-        # --- 新增：將啟動與中斷按鈕放在同一排 ---
         action_layout = QHBoxLayout()
         self.btn_run = QPushButton("啟動功能 (開始合併)")
         self.btn_run.setObjectName("actionBtn")
@@ -103,13 +104,12 @@ class GoProMergerApp(QMainWindow):
         
         self.btn_cancel = QPushButton("🛑 中斷任務")
         self.btn_cancel.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; font-size: 14px; padding: 8px; border-radius: 3px;")
-        self.btn_cancel.setEnabled(False) # 預設反灰不能按
+        self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.cancel_processing)
         
         action_layout.addWidget(self.btn_run, stretch=3)
         action_layout.addWidget(self.btn_cancel, stretch=1)
         main_layout.addLayout(action_layout)
-        # ----------------------------------------
 
         progress_layout = QHBoxLayout()
         self.progress_bar = QProgressBar()
@@ -123,10 +123,25 @@ class GoProMergerApp(QMainWindow):
         self.log_area.setReadOnly(True)
         main_layout.addWidget(self.log_area, stretch=2)
 
+    def set_ui_locked(self, locked: bool):
+        """💡 鎖定或解鎖 UI，防止在處理期間發生檔案異動"""
+        self.btn_auto_sort.setEnabled(not locked)
+        self.btn_add_part.setEnabled(not locked)
+        self.btn_clear.setEnabled(not locked)
+        self.btn_set_output.setEnabled(not locked)
+        
+        if locked:
+            self.tree.setAcceptDrops(False)
+            self.tree.setDragEnabled(False)
+            self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        else:
+            self.tree.setAcceptDrops(True)
+            self.tree.setDragEnabled(True)
+            self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
     def log(self, text, level="INFO"):
         self.log_area.append(text)
         self.log_area.verticalScrollBar().setValue(self.log_area.verticalScrollBar().maximum())
-        # 同步記錄到檔案
         if level == "INFO": logging.info(text.strip())
         elif level == "ERROR": logging.error(text.strip())
 
@@ -144,11 +159,9 @@ class GoProMergerApp(QMainWindow):
             self.output_folder = folder
             self.lbl_output.setText(f"輸出資料夾: {self.output_folder}")
             self.lbl_output.setStyleSheet("color: #4CAF50; font-weight: bold;")
-            # 儲存設定
             AppUtils.save_config({"last_output_folder": self.output_folder})
 
     def cancel_processing(self):
-        """按下中斷按鈕時觸發"""
         if hasattr(self, 'process_thread') and self.process_thread.isRunning():
             reply = QMessageBox.question(self, '確認', '確定要強制中斷目前的合併任務嗎？', 
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -185,11 +198,32 @@ class GoProMergerApp(QMainWindow):
                                f"目標硬碟空間不足！\n\n需要：約 {required_gb:.2f} GB\n剩餘：{free_gb:.2f} GB\n\n請清理空間或更換輸出資料夾。")
             return
 
-        # 切換按鈕狀態
+        # 💡 防呆機制：事前檢查是否有同名檔案即將被覆蓋
+        existing_files = []
+        for part_name in tree_data.keys():
+            expected_mp4 = os.path.join(self.output_folder, f"{part_name}_merged.mp4")
+            if os.path.exists(expected_mp4):
+                existing_files.append(f"{part_name}_merged.mp4")
+                
+        if existing_files:
+            msg = "以下檔案已存在於輸出資料夾，繼續執行將會直接覆蓋它們：\n\n"
+            msg += "\n".join(existing_files[:5])
+            if len(existing_files) > 5:
+                msg += f"\n...等共 {len(existing_files)} 個檔案"
+            msg += "\n\n確定要繼續並覆蓋舊檔案嗎？"
+            
+            reply = QMessageBox.warning(self, "覆蓋警告", msg, 
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                return
+
         self.btn_run.setEnabled(False)
         self.btn_run.setText("處理中...")
         self.btn_cancel.setEnabled(True)
         self.btn_cancel.setText("🛑 中斷任務")
+        
+        # 💡 啟動時鎖住介面
+        self.set_ui_locked(True)
         
         self.log(f"🚀 開始任務，預計總產出大小：{required_gb:.2f} GB")
         
@@ -200,11 +234,12 @@ class GoProMergerApp(QMainWindow):
         self.process_thread.start()
 
     def on_process_finished(self):
-        # 任務結束後恢復按鈕狀態
         self.btn_run.setEnabled(True)
         self.btn_run.setText("啟動功能 (開始合併)")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.setText("🛑 中斷任務")
+        # 💡 任務結束或中斷時解鎖介面
+        self.set_ui_locked(False)
 
     def update_progress(self, percent, eta_str):
         self.progress_bar.setValue(percent)
@@ -257,31 +292,13 @@ class GoProMergerApp(QMainWindow):
             return
 
         self.tree.clear()
-        groups = {}
-        for file_path in all_files:
-            filename = os.path.basename(file_path)
-            if filename.upper().startswith('GX') or filename.upper().endswith(('.JPG', '.PNG', '.JPEG')):
-                mtime = os.path.getmtime(file_path)
-                date_key = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d')
-                groups.setdefault(date_key, []).append(file_path)
-            else:
-                groups.setdefault('未分類', []).append(file_path)
+        
+        groups = GoProParser.group_files_by_date(all_files)
 
         for date_key, files in groups.items():
             part_item = QTreeWidgetItem([f"Part_{date_key}"])
             part_item.setExpanded(True)
             self.tree.addTopLevelItem(part_item)
-            
-            # 💡 更新排序邏輯：加入 GOPR 照片的流水號判斷
-            def custom_sort(filepath):
-                fname = os.path.basename(filepath).upper()
-                if fname.startswith('GX') and len(fname) >= 12:
-                    return (0, fname[4:8], fname[2:4]) # (優先權, 流水號, 章節)
-                elif fname.startswith('GOPR') and len(fname) >= 12:
-                    return (0, fname[4:8], '00')       # 照片章節設為 '00'，會排在同號碼影片的前面
-                return (1, os.path.getmtime(filepath), fname) # 其他設備檔案 (如 iPhone) 依時間排序
-                
-            files.sort(key=custom_sort)
             
             for file_path in files:
                 child_item = QTreeWidgetItem([file_path])

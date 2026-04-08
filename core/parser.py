@@ -2,42 +2,32 @@ import os
 import datetime
 
 class GoProParser:
-    def __init__(self, folder_path):
-        self.folder_path = folder_path
+    @staticmethod
+    def get_sort_key(filepath):
+        """統一的排序邏輯：GoPro影片/照片優先，其餘依時間排序"""
+        fname = os.path.basename(filepath).upper()
+        if fname.startswith('GX') and len(fname) >= 12:
+            return (0, fname[4:8], fname[2:4]) # (優先權, 流水號, 章節)
+        elif fname.startswith('GOPR') and len(fname) >= 12:
+            return (0, fname[4:8], '00')       # 照片章節設為 '00'，排在同號影片前
+        return (1, os.path.getmtime(filepath), fname) # 其他設備檔案依修改時間
 
-    def get_daily_groups(self):
-        video_groups = {}
-        if not os.path.isdir(self.folder_path):
-            return video_groups
-
-        valid_exts = ('.MP4', '.JPG', '.JPEG', '.PNG')
-
-        for file in os.listdir(self.folder_path):
-            if file.upper().endswith(valid_exts):
-                full_path = os.path.join(self.folder_path, file)
-                
-                # 排除非 GoPro 的一般 MP4
-                if file.upper().endswith('.MP4') and not file.upper().startswith('GX'):
-                    continue
-
-                mtime = os.path.getmtime(full_path)
+    @staticmethod
+    def group_files_by_date(file_paths):
+        """將傳入的檔案清單依日期分組，並自動套用智慧排序"""
+        groups = {}
+        for file_path in file_paths:
+            fname = os.path.basename(file_path).upper()
+            # 判斷是否為 GoPro 影片或各式照片
+            if fname.startswith('GX') or fname.endswith(('.JPG', '.PNG', '.JPEG')):
+                mtime = os.path.getmtime(file_path)
                 date_key = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d')
-                
-                if date_key not in video_groups:
-                    video_groups[date_key] = []
-                
-                video_groups[date_key].append(file)
-
-        for date_key in video_groups:
-            video_groups[date_key] = self._sort_gopro_files(video_groups[date_key])
+                groups.setdefault(date_key, []).append(file_path)
+            else:
+                groups.setdefault('未分類', []).append(file_path)
+        
+        # 對每個分組進行內部排序，確保統一性
+        for date_key in groups:
+            groups[date_key].sort(key=GoProParser.get_sort_key)
             
-        return video_groups
-
-    def _sort_gopro_files(self, file_list):
-        def sort_key(filename):
-            if filename.upper().endswith('.MP4') and len(filename) >= 12:
-                chapter = filename[2:4]
-                group = filename[4:8]
-                return (group, chapter)
-            return (filename, "")
-        return sorted(file_list, key=sort_key)
+        return groups
