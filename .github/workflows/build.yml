@@ -1,0 +1,54 @@
+name: Build Multi-OS Releases
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    # 這裡的名稱會動態顯示，例如 "Build on windows-latest"
+    name: Build on ${{ matrix.os }}
+    
+    # 💡 魔法在這裡：設定建置矩陣 (Matrix)
+    strategy:
+      matrix:
+        # 告訴 GitHub：我要同時開這三種作業系統的虛擬機！
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    # 讓這份腳本在矩陣指定的每一台機器上各自跑一次
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: 1. 取得程式碼
+      uses: actions/checkout@v4
+
+    - name: 2. 設定 Python 環境
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: 3. 安裝 Linux 專屬的 GUI 系統相依套件 (Windows/Mac 會自動跳過)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libxcb-cursor0
+
+    - name: 4. 安裝 Python 相依套件
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller PyQt6
+
+    - name: 5. 執行 PyInstaller 打包 (動態命名)
+      run: |
+        # 💡 將產出的檔名加上作業系統名稱，避免上傳時互相覆蓋
+        pyinstaller --onefile --windowed --name="GoPro_Daily_Merger_${{ matrix.os }}" main.py
+
+    - name: 6. 自動上傳至 GitHub Releases
+      uses: softprops/action-gh-release@v2
+      with:
+        # 💡 使用萬用字元 * # 因為 Windows 產出會有 .exe，但 Mac/Linux 沒有副檔名，用 * 就可以通殺！
+        files: dist/GoPro_Daily_Merger_${{ matrix.os }}*
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
